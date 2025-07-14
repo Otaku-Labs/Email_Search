@@ -10,12 +10,15 @@ import re
 
 class EmailDomainSearcher:
     def __init__(self, search_path: str, exclude_dirs_file: str = "exclude_dirs.txt", 
+                 exclude_files_file: str = "exclude_files.txt", 
                  output_file: str = "search_results.txt"):
         self.search_path = Path(search_path).resolve()
         self.exclude_dirs_file = Path(exclude_dirs_file)
+        self.exclude_files_file = Path(exclude_files_file)
         self.output_file = Path(output_file)
         self.domain = ""
         self.excluded_dirs: Set[str] = set()
+        self.excluded_files: Set[str] = set()
         
         # Common binary file extensions to skip
         self.binary_extensions = {
@@ -38,7 +41,7 @@ class EmailDomainSearcher:
             print(f"Set domain to {self.domain}")
         return self.domain
     
-    def create_default_exclude_file(self) -> None:
+    def create_default_exclude_dirs_file(self) -> None:
         """Create default exclude directories file"""
         default_excludes = [
             "# Directories to exclude from search (one per line)",
@@ -55,11 +58,29 @@ class EmailDomainSearcher:
             f.write('\n'.join(default_excludes) + '\n')
         print(f"Created default exclude file: {self.exclude_dirs_file}")
     
+    def create_default_exclude_files_file(self) -> None:
+        """Create default exclude files file"""
+        default_file_excludes = [
+            "# Files to exclude from search (one per line)",
+            "# Lines starting with # are comments",
+            "# Supports glob patterns like *.log or exact names",
+            ".bash_history", ".zsh_history", ".fish_history",
+            ".python_history", ".mysql_history", ".psql_history",
+            ".sqlite_history", ".node_repl_history", ".lesshst",
+            "*.log", "*.swp", "*.swo", "*~", ".DS_Store",
+            "*.tmp", "*.temp", "*.bak", "*.backup", "*.old",
+            "core", "core.*", "*.core", "vgcore.*"
+        ]
+        
+        with open(self.exclude_files_file, 'w') as f:
+            f.write('\n'.join(default_file_excludes) + '\n')
+        print(f"Created default exclude files file: {self.exclude_files_file}")
+    
     def load_excluded_dirs(self) -> None:
         """Load excluded directories from file"""
         if not self.exclude_dirs_file.exists():
             print(f"Exclude directories file \"{self.exclude_dirs_file}\" not found. Creating default...")
-            self.create_default_exclude_file()
+            self.create_default_exclude_dirs_file()
         
         with open(self.exclude_dirs_file, 'r') as f:
             for line in f:
@@ -67,10 +88,39 @@ class EmailDomainSearcher:
                 if line and not line.startswith('#'):
                     self.excluded_dirs.add(line)
     
+    def load_excluded_files(self) -> None:
+        """Load excluded files from file"""
+        if not self.exclude_files_file.exists():
+            print(f"Exclude files file \"{self.exclude_files_file}\" not found. Creating default...")
+            self.create_default_exclude_files_file()
+        
+        with open(self.exclude_files_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    self.excluded_files.add(line)
+    
     def is_excluded_dir(self, dir_path: Path) -> bool:
         """Check if directory should be excluded"""
         dir_name = dir_path.name
         return dir_name in self.excluded_dirs
+    
+    def is_excluded_file(self, file_path: Path) -> bool:
+        """Check if file should be excluded"""
+        file_name = file_path.name
+        
+        for pattern in self.excluded_files:
+            # Support glob patterns
+            if '*' in pattern or '?' in pattern:
+                import fnmatch
+                if fnmatch.fnmatch(file_name, pattern):
+                    return True
+            else:
+                # Exact match
+                if file_name == pattern:
+                    return True
+        
+        return False
     
     def is_binary_file(self, file_path: Path) -> bool:
         """Check if file is likely binary"""
@@ -126,7 +176,7 @@ class EmailDomainSearcher:
                                 print(f"DEBUG: Found on line {i}: {line.strip()}")
                                 break
                 return found
-        except (OSError, IOError, UnicodeDecodeError):
+        except (OSError, IOError, UnicodeDecodeError) as e:
             # Try with different encoding
             try:
                 with open(file_path, 'r', encoding='latin-1', errors='ignore') as f:
@@ -135,18 +185,32 @@ class EmailDomainSearcher:
                     if hasattr(self, 'debug') and self.debug:
                         print(f"DEBUG: Searching {file_path} (latin-1) for '{domain}' -> {'FOUND' if found else 'NOT FOUND'}")
                     return found
-            except (OSError, IOError):
+            except (OSError, IOError) as e:
                 if hasattr(self, 'debug') and self.debug:
-                    print(f"DEBUG: Cannot read file: {file_path}")
+                    if "Permission denied" in str(e):
+                        print(f"DEBUG: Permission denied reading file: {file_path}")
+                    else:
+                        print(f"DEBUG: Cannot read file: {file_path} - {e}")
                 return False
     
     def find_files(self) -> Generator[Path, None, None]:
         """Generator that yields all files to search"""
         total_files = 0
         excluded_dirs = 0
+        excluded_files = 0
+        permission_denied = 0
         
         for root, dirs, files in os.walk(self.search_path):
             root_path = Path(root)
+            
+            # Check if we can read this directory
+            try:
+                os.listdir(root)
+            except PermissionError:
+                if hasattr(self, 'debug') and self.debug:
+                    print(f"DEBUG: Permission denied accessing directory: {root_path}")
+                permission_denied += 1
+                continue
             
             # Filter out excluded directories
             original_dirs = dirs[:]
@@ -160,6 +224,14 @@ class EmailDomainSearcher:
             
             for file_name in files:
                 file_path = root_path / file_name
+                
+                # Check if file should be excluded
+                if self.is_excluded_file(file_path):
+                    if hasattr(self, 'debug') and self.debug:
+                        print(f"DEBUG: Excluding file: {file_path}")
+                    excluded_files += 1
+                    continue
+                
                 if file_path.is_file():
                     total_files += 1
                     if hasattr(self, 'debug') and self.debug and total_files <= 10:
@@ -169,18 +241,23 @@ class EmailDomainSearcher:
         if hasattr(self, 'debug') and self.debug:
             print(f"DEBUG: Total files found: {total_files}")
             print(f"DEBUG: Total directories excluded: {excluded_dirs}")
+            print(f"DEBUG: Total files excluded: {excluded_files}")
+            print(f"DEBUG: Total permission denied: {permission_denied}")
     
     def search_domain(self) -> List[Path]:
         """Search for domain in all files"""
         domain = self.get_domain()
         self.load_excluded_dirs()
+        self.load_excluded_files()
         
         print(f"Searching for domain '{domain}' in files under: {self.search_path}")
         print(f"Using exclude directories from: {self.exclude_dirs_file}")
+        print(f"Using exclude files from: {self.exclude_files_file}")
         print(f"Results will be saved in {self.output_file}")
         print("=" * 70)
         print("Scanning files...")
-        print("Note: Binary files and common non-text files are automatically skipped")
+        print("Note: Binary files and excluded files are automatically skipped")
+        print("Note: Files with permission denied are skipped (run with higher privileges if needed)")
         print()
         
         matching_files = []
@@ -266,6 +343,12 @@ Examples:
     )
     
     parser.add_argument(
+        '-f', '--exclude-files',
+        default='exclude_files.txt',
+        help='File containing files to exclude (default: exclude_files.txt)'
+    )
+    
+    parser.add_argument(
         '-o', '--output',
         default='search_results.txt',
         help='Output file for results (default: search_results.txt)'
@@ -287,6 +370,7 @@ Examples:
     searcher = EmailDomainSearcher(
         search_path=args.search_path,
         exclude_dirs_file=args.exclude_dirs,
+        exclude_files_file=args.exclude_files,
         output_file=args.output
     )
     
